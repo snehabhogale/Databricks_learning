@@ -3,20 +3,20 @@
 # [tool.databricks.environment]
 # environment_version = "5"
 # ///
-# ============================================================
-# GENERIC AUTO LOADER NOTEBOOK — DEMO VERSION
-#
-# ONE PARAMETER ONLY:
-#     ecname
-#
-# Configuration for mutiple stage tables:
-#     demo_autoloader.etlcontrol
-#     demo_autoloader.autoloader_config
-#     demo_autoloader.query_repo
-#
-# One notebook is reused by mutiple independent Job Tasks.
-# ============================================================
+# MAGIC %md
+# MAGIC # Generic Databricks Auto Loader — Config-Driven Demo
+# MAGIC
+# MAGIC **Goal:** Reuse one notebook for multiple independent sources. Each Databricks Workflow task passes only `ecname`; all source, target, checkpoint, schema, mapping, and merge behavior comes from configuration tables.
+# MAGIC
+# MAGIC **Flow:** `ecname` → config lookup → Auto Loader → `foreachBatch` → staging → merge / soft delete → audit logs
+# MAGIC
+# MAGIC **Important:** Give every `ecname` its own source path, schema location, and checkpoint location. Never share a checkpoint between independent streams.
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1. Input parameter and imports
+# MAGIC The workflow task passes only `ecname`. The same notebook can therefore be reused by `users_demo`, `orders_demo`, and other sources.
 
 # COMMAND ----------
 
@@ -28,7 +28,6 @@ import uuid
 import time
 
 from functools import reduce
-from datetime import datetime
 
 from pyspark.sql import functions as F
 from pyspark.sql.functions import (
@@ -55,6 +54,11 @@ print(f"Starting Generic Auto Loader")
 print(f"ECNAME : {ecname}")
 print(f"===================================================")
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Resolve the Databricks run ID
+# MAGIC Captures job/task context for audit logging. Manual notebook execution falls back to `manual_run`.
 
 # COMMAND ----------
 
@@ -90,21 +94,11 @@ except Exception:
 
 print(f"Pipeline Run ID : {run_id}")
 
-
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC   SELECT
-# MAGIC             id,
-# MAGIC             ecname,
-# MAGIC             metadatatype,
-# MAGIC             batchsetting,
-# MAGIC             sourceobject,
-# MAGIC             sinkobject,
-# MAGIC             loadsetting,
-# MAGIC             mappingsettings,
-# MAGIC             enableflag
-# MAGIC         FROM demo_autoloader.etlcontrol
+# MAGIC %md
+# MAGIC ## 3. Read ETL control configuration
+# MAGIC Loads the latest enabled control row for the selected `ecname`. This provides mapping, source/sink metadata, and load settings.
 
 # COMMAND ----------
 
@@ -151,6 +145,11 @@ except Exception as e:
     print(f"[ERROR] etlcontrol lookup failed: {e}")
     raise
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Parse JSON configuration
+# MAGIC Safely converts JSON strings from the control table into Python dictionaries.
 
 # COMMAND ----------
 
@@ -179,6 +178,11 @@ loadsetting = safe_json(loadsetting_str)
 
 print("ETL configuration loaded")
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Read Auto Loader configuration
+# MAGIC Loads source path, schema location, checkpoint, target table, archive settings, and optional scale controls for this source.
 
 # COMMAND ----------
 
@@ -207,6 +211,11 @@ except Exception as e:
     print(f"[ERROR] autoloader_config lookup failed: {e}")
     raise
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Resolve runtime paths and target objects
+# MAGIC Builds the target, staging, and delete-staging table names. Each source should have isolated schema and checkpoint locations.
 
 # COMMAND ----------
 
@@ -296,8 +305,9 @@ if not target_full_name:
     )
 
 
-target_schema = target_full_name.split(".")[0]
-target_table_name = target_full_name.split(".")[1]
+target_parts = target_full_name.split(".")
+target_table_name = target_parts[-1]
+target_schema = ".".join(target_parts[:-1])
 
 staging_table = (
     f"{target_schema}.{target_table_name}_stg"
@@ -315,6 +325,11 @@ print(f"Checkpoint Location : {checkpoint_location}")
 print(f"Archive Enabled     : {archive_enabled}")
 print(f"Archive Directory   : {archive_directory}")
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Validate the source path
+# MAGIC Fail fast if the configured source path is missing.
 
 # COMMAND ----------
 
@@ -328,6 +343,11 @@ if not source_path:
 
 print(f"Source Path : {source_path}")
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8. Error logging helper
+# MAGIC Central helper for recording pipeline failures in `etl_error_log` without hiding the original exception.
 
 # COMMAND ----------
 
@@ -385,6 +405,11 @@ def log_pipeline_error(
             f"{log_error}"
         )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9. Parse source-to-target mappings
+# MAGIC Converts `mappingsettings` into a source → sink mapping and identifies the source field mapped to target `id`.
 
 # COMMAND ----------
 
@@ -481,6 +506,11 @@ print(
     f"ID source column : {id_source_column}"
 )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 10. Validate target schema
+# MAGIC Mapped target columns must already exist. The notebook intentionally does not alter the target schema automatically.
 
 # COMMAND ----------
 
@@ -543,94 +573,18 @@ print(
     f"{len(mapped_target_columns)}"
 )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 11. Configure Auto Loader
+# MAGIC Uses JSON + rescue mode, filters out `.done` marker files, applies optional backpressure, and optionally enables notification-based discovery.
 
 # COMMAND ----------
 
-# STEP 11 — AUTO LOADER OPTIONS
-# ============================================================
-#
-# IMPORTANT:
-#
-# schemaEvolutionMode = rescue
-#
-# This is intentional.
-#
-# We DO NOT want Auto Loader to automatically add
-# columns to the target/staging table.
-#
-# New fields are captured in rescued_data instead.
-#
-# ------------------------------------------------------------
-#
-# pathGlobFilter = "*.json"
-#
-# The source directory also contains .done marker files
-# (one per .json file, holding its expected record count
-# for downstream count-check validation only). These must
-# never be discovered/parsed by Auto Loader as data files,
-# so the glob filter restricts discovery to *.json only.
-#
-# ------------------------------------------------------------
-#
-# maxFilesPerTrigger / maxBytesPerTrigger
-#
-# With trigger(availableNow=True), Auto Loader will otherwise
-# try to discover and queue up EVERY backlog file before the
-# first micro-batch even starts. If a large drop lands (e.g.
-# a backfill, an upstream outage catching up, or simply a busy
-# day for this ecname), that single run can blow past cluster
-# memory/shuffle limits or just take a very long time before
-# foreachBatch produces its first log line.
-#
-# Setting a per-trigger cap makes availableNow=True process the
-# backlog across many small, bounded micro-batches instead of
-# one huge one. Each micro-batch still commits its own offset
-# to the checkpoint, so nothing is lost or reprocessed if a
-# later batch fails partway through the backlog — Structured
-# Streaming resumes from the last committed micro-batch.
-#
-# Tune these two per ecname's typical file size via
-# autoloader_config if some sources are much larger than
-# others; the values below are conservative demo defaults.
-#
-# ------------------------------------------------------------
-#
-# cloudFiles.useNotifications
-#
-# Default (false) = directory LISTING mode. Every run, Auto
-# Loader lists the source path to find files newer than its
-# checkpoint. Fine at low-to-moderate file counts. At millions
-# of files in a single source directory, that LIST call itself
-# becomes the bottleneck and cost driver on every single run,
-# independent of how few files are actually new.
-#
-# Setting this to true switches to NOTIFICATION mode: Auto
-# Loader has Databricks provision a cloud queue (S3 event
-# notifications -> SQS on AWS, ADLS -> Event Grid+Queue on
-# Azure) once, then each run just drains that queue for files
-# that arrived since last drain — no full directory listing,
-# so cost/latency stop scaling with total files in the path
-# and instead scale with new files since last run.
-#
-# This is OFF by default here because it requires one-time
-# cloud-side setup (the storage credential/service principal
-# Databricks uses must be allowed to create the queue and
-# notification config on your bucket/container - see
-# https://docs.databricks.com/en/ingestion/cloud-object-storage/auto-loader/file-notification-mode.html).
-# Set use_notifications = 'y' in autoloader_config per-ecname
-# once that's done, particularly for any ecname whose source
-# directory is expected to hold millions of files.
-#
-# Note this is a SEPARATE concern from the Databricks Jobs
-# "file arrival trigger" discussed in scheduling notes below —
-# that trigger decides WHEN this notebook runs; this option
-# controls how Auto Loader finds new files ONCE it's running.
-# Enabling file events on the Unity Catalog external location
-# (for the job trigger) does not enable this; they're
-# configured independently, even though both ultimately rely
-# on the same underlying cloud notification services.
-#
-# ============================================================
+# STEP 11 — AUTO LOADER READER OPTIONS
+# Keep schema evolution controlled with rescue mode.
+# Limit files/bytes per trigger to keep large backlogs manageable.
+# Notification mode is optional and controlled per ecname.
 
 max_files_per_trigger = str(
     cfg_value(auto_cfg, "max_files_per_trigger", "1000")
@@ -698,6 +652,11 @@ if use_notifications:
         f"for {source_path} instead of directory listing."
     )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 12. Load the streaming source
+# MAGIC Adds `_metadata.file_path` so each record can be traced back to its input file.
 
 # COMMAND ----------
 
@@ -713,11 +672,17 @@ source_stream = (
     )
 )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 13. Process each micro-batch
+# MAGIC Handles schema-drift detection, per-file source IDs, mappings, deduplication, staging, merge, soft deletes, and audit logging.
+# MAGIC
+# MAGIC **Schema-drift note:** the current implementation logs and filters records containing `_rescued_data`. Because a successful `foreachBatch` can advance the checkpoint for the whole micro-batch, do not describe filtered files as automatically retryable without an explicit retry/quarantine design.
 
 # COMMAND ----------
 
 # STEP 13 — FOREACH BATCH PROCESSOR
-# ============================================================
 
 def process_batch(
     micro_batch_df,
@@ -752,10 +717,7 @@ def process_batch(
 
             return
 
-
-        # ------------------------------------------------
         # STEP 13A — GET FILE INFORMATION
-        # ------------------------------------------------
 
         file_df = (
             micro_batch_df
@@ -773,13 +735,11 @@ def process_batch(
             )
         )
 
-
         incoming_files = [
             row["filename"]
             for row
             in file_df.collect()
         ]
-
 
         print(
             f"Files received : "
@@ -790,100 +750,12 @@ def process_batch(
             incoming_files
         )
 
+        # STEP 13B — WHY THERE'S NO "ALREADY PROCESSED"
+        # (STEP 13X) for audit/observability — it's just no
 
-        # ------------------------------------------------
-        # STEP 13B — CHECK ALREADY PROCESSED FILES
-        # ------------------------------------------------
+        working_df = micro_batch_df
 
-        if incoming_files:
-
-            escaped_files = [
-                f.replace("'", "''")
-                for f in incoming_files
-            ]
-
-            files_clause = ", ".join(
-                f"'{f}'"
-                for f in escaped_files
-            )
-
-            processed_rows = spark.sql(f"""
-                SELECT DISTINCT filename
-                FROM demo_autoloader.file_process_logs
-                WHERE tablename =
-                    '{target_table_name}'
-                  AND status = 'SUCCESS'
-                  AND filename IN ({files_clause})
-            """).collect()
-
-            processed_files = {
-                r["filename"]
-                for r in processed_rows
-            }
-
-        else:
-
-            processed_files = set()
-
-
-        print(
-            f"Already processed : "
-            f"{len(processed_files)}"
-        )
-
-
-        # ------------------------------------------------
-        # STEP 13C — REMOVE ALREADY PROCESSED FILES
-        # ------------------------------------------------
-
-        new_file_names = [
-            f
-            for f in incoming_files
-            if f not in processed_files
-        ]
-
-
-        if not new_file_names:
-
-            print(
-                "All files already processed."
-            )
-
-            return
-
-
-        new_file_names_set = set(
-            new_file_names
-        )
-
-
-        working_df = (
-            micro_batch_df
-            .filter(
-                regexp_extract(
-                    col("_input_file_path"),
-                    r"([^/]+)$",
-                    1
-                ).isin(
-                    list(new_file_names_set)
-                )
-            )
-        )
-
-
-        # ------------------------------------------------
         # STEP 13D — SCHEMA DRIFT CHECK
-        # ------------------------------------------------
-        #
-        # New columns are NOT automatically added.
-        #
-        # Auto Loader puts unknown fields in
-        # _rescued_data.
-        #
-        # If _rescued_data contains values,
-        # schema change requires confirmation.
-        #
-        # ------------------------------------------------
 
         rescued_count = 0
 
@@ -897,7 +769,6 @@ def process_batch(
                 .limit(1)
                 .count()
             )
-
 
         if rescued_count > 0:
 
@@ -918,7 +789,6 @@ def process_batch(
                 .distinct()
                 .collect()
             )
-
 
             for row in drift_files:
 
@@ -945,25 +815,10 @@ def process_batch(
                     filename
                 )
 
-
-            # ------------------------------------------------
-            # IMPORTANT
-            # ------------------------------------------------
-            #
-            # Do not process files with schema drift.
-            #
-            # They remain discoverable by Auto Loader.
-            #
-            # After configuration is corrected,
-            # the stream can process them.
-            #
-            # ------------------------------------------------
-
             drift_file_names = {
                 r["filename"]
                 for r in drift_files
             }
-
 
             working_df = (
                 working_df
@@ -980,10 +835,7 @@ def process_batch(
                 )
             )
 
-
-        # ------------------------------------------------
         # STEP 13E — IF NOTHING VALID REMAINS
-        # ------------------------------------------------
 
         if working_df.isEmpty():
 
@@ -993,24 +845,7 @@ def process_batch(
 
             return
 
-
-        # ------------------------------------------------
         # STEP 13F — ASSIGN SOURCE IDS
-        # ------------------------------------------------
-        #
-        # Source IDs are maintained independently
-        # per ECNAME.
-        #
-        # REQUIRED TABLE:
-        #
-        # file_process_id_sequence
-        #
-        # columns:
-        #   ecname
-        #   id
-        #   lock_token
-        #
-        # ------------------------------------------------
 
         valid_file_names = [
             r["filename"]
@@ -1027,21 +862,17 @@ def process_batch(
             .collect()
         ]
 
-
         file_count = len(
             valid_file_names
         )
 
-
         sourceid_map = {}
-
 
         if file_count > 0:
 
             lock_token = str(
                 uuid.uuid4()
             )
-
 
             for attempt in range(1, 6):
 
@@ -1102,7 +933,6 @@ def process_batch(
 
                         raise
 
-
             sequence_row = spark.sql(f"""
                 SELECT id
                 FROM demo_autoloader.file_process_id_seq
@@ -1112,13 +942,11 @@ def process_batch(
                     '{lock_token}'
             """).collect()
 
-
             if not sequence_row:
 
                 raise Exception(
                     "Could not obtain source ID sequence"
                 )
-
 
             sourceid_end = (
                 sequence_row[0]["id"]
@@ -1129,7 +957,6 @@ def process_batch(
                 - file_count
                 + 1
             )
-
 
             for idx, filename in enumerate(
                 sorted(valid_file_names)
@@ -1142,17 +969,13 @@ def process_batch(
                     + idx
                 )
 
-
         print(
             f"Source ID range : "
             f"{sourceid_start} -> "
             f"{sourceid_end}"
         )
 
-
-        # ------------------------------------------------
         # STEP 13G — SOURCE ID LOOKUP
-        # ------------------------------------------------
 
         sourceid_lookup_df = (
             spark.createDataFrame(
@@ -1173,7 +996,6 @@ def process_batch(
             )
         )
 
-
         working_df = (
             working_df
             .withColumn(
@@ -1193,10 +1015,7 @@ def process_batch(
             )
         )
 
-
-        # ------------------------------------------------
         # STEP 13H — SEPARATE DELETE FILES
-        # ------------------------------------------------
 
         working_df = (
             working_df
@@ -1208,14 +1027,12 @@ def process_batch(
             )
         )
 
-
         regular_df = (
             working_df
             .filter(
                 ~col("_is_delete")
             )
         )
-
 
         delete_df = (
             working_df
@@ -1224,10 +1041,7 @@ def process_batch(
             )
         )
 
-
-        # ------------------------------------------------
         # STEP 13I — REGULAR DATA MAPPING
-        # ------------------------------------------------
 
         regular_count = (
             regular_df
@@ -1235,10 +1049,8 @@ def process_batch(
             .count()
         )
 
-
         merged_count = 0
         deleted_count = 0
-
 
         if regular_count > 0:
 
@@ -1246,9 +1058,7 @@ def process_batch(
                 regular_df.dtypes
             )
 
-
             select_expressions = []
-
 
             for (
                 source_col,
@@ -1258,13 +1068,11 @@ def process_batch(
                 if source_col not in column_dtypes:
                     continue
 
-
                 source_dtype = (
                     column_dtypes[
                         source_col
                     ]
                 )
-
 
                 # Array → comma-separated string
                 if (
@@ -1294,13 +1102,11 @@ def process_batch(
                         )
                     )
 
-
             if not select_expressions:
 
                 raise Exception(
                     "No mapped columns found."
                 )
-
 
             staged_df = (
                 regular_df
@@ -1327,10 +1133,7 @@ def process_batch(
                 )
             )
 
-
-            # ------------------------------------------------
             # DEDUPLICATE BY ID + NEWEST SOURCE ID
-            # ------------------------------------------------
 
             staged_df = (
                 staged_df
@@ -1355,21 +1158,16 @@ def process_batch(
                 )
             )
 
-
             merged_count = (
                 staged_df.count()
             )
-
 
             print(
                 f"Records to merge : "
                 f"{merged_count}"
             )
 
-
-            # ------------------------------------------------
             # WRITE STAGING
-            # ------------------------------------------------
 
             if merged_count > 0:
 
@@ -1386,7 +1184,6 @@ def process_batch(
 
                     pass
 
-
                 (
                     staged_df
                     .write
@@ -1401,10 +1198,7 @@ def process_batch(
                     )
                 )
 
-
-                # ------------------------------------------------
                 # GET EXISTING MERGE QUERY
-                # ------------------------------------------------
 
                 merge_rows = spark.sql(f"""
                     SELECT query_text
@@ -1416,7 +1210,6 @@ def process_batch(
                     LIMIT 1
                 """).collect()
 
-
                 if not merge_rows:
 
                     raise Exception(
@@ -1424,20 +1217,15 @@ def process_batch(
                         f"for ecname='{ecname}'"
                     )
 
-
                 merge_query = (
                     merge_rows[0]["query_text"]
                 )
 
-
-                # ------------------------------------------------
                 # EXECUTE EXISTING MERGE
-                # ------------------------------------------------
 
                 spark.sql(
                     merge_query
                 )
-
 
                 # Reset deleted records
                 spark.sql(f"""
@@ -1453,10 +1241,7 @@ def process_batch(
                       AND deleted_flag = 'Y'
                 """)
 
-
-        # ------------------------------------------------
         # STEP 13J — DELETE PROCESSING
-        # ------------------------------------------------
 
         if (
             delete_df
@@ -1466,14 +1251,12 @@ def process_batch(
 
             delete_parts = []
 
-
             delete_files = (
                 delete_df
                 .select("_fn", "_sid")
                 .distinct()
                 .collect()
             )
-
 
             for file_row in delete_files:
 
@@ -1484,7 +1267,6 @@ def process_batch(
                 file_sid = (
                     file_row["_sid"]
                 )
-
 
                 raw_delete_df = (
                     working_df
@@ -1497,14 +1279,12 @@ def process_batch(
                     )
                 )
 
-
                 if (
                     id_source_column
                     not in raw_delete_df.columns
                 ):
 
                     continue
-
 
                 delete_parts.append(
                     raw_delete_df
@@ -1528,7 +1308,6 @@ def process_batch(
                     )
                 )
 
-
             if delete_parts:
 
                 delete_id_df = reduce(
@@ -1536,11 +1315,6 @@ def process_batch(
                     a.unionByName(b),
                     delete_parts
                 )
-
-
-                # ------------------------------------------------
-                # FIND NEWEST EVENT FOR EACH ID
-                # ------------------------------------------------
 
                 delete_winners = (
                     delete_id_df
@@ -1575,11 +1349,9 @@ def process_batch(
                     )
                 )
 
-
                 deleted_count = (
                     delete_winners.count()
                 )
-
 
                 if deleted_count > 0:
 
@@ -1596,7 +1368,6 @@ def process_batch(
 
                         pass
 
-
                     (
                         delete_winners
                         .write
@@ -1611,10 +1382,7 @@ def process_batch(
                         )
                     )
 
-
-                    # ------------------------------------------------
                     # SOFT DELETE
-                    # ------------------------------------------------
 
                     spark.sql(f"""
                         MERGE INTO
@@ -1651,33 +1419,26 @@ def process_batch(
                                 d.sourceid
                     """)
 
-
                     print(
                         f"Deleted records : "
                         f"{deleted_count}"
                     )
 
-
-        # ------------------------------------------------
         # STEP 13K — FILE PROCESS LOG
-        # ------------------------------------------------
 
         successful_files = (
             valid_file_names
         )
 
-
         if successful_files:
 
             log_rows = []
-
 
             for filename in successful_files:
 
                 sid = sourceid_map[
                     filename
                 ]
-
 
                 log_rows.append(
                     f"""
@@ -1697,7 +1458,6 @@ def process_batch(
                     )
                     """
                 )
-
 
             spark.sql(f"""
                 INSERT INTO
@@ -1720,22 +1480,7 @@ def process_batch(
                     {','.join(log_rows)}
             """)
 
-
-        # ------------------------------------------------
         # STEP 13K.1 — CLEAN STAGING TABLES
-        # ------------------------------------------------
-        #
-        # Once file_process_logs confirms a sourceid
-        # was SUCCESSfully merged into the target table,
-        # that data no longer needs to sit in staging.
-        #
-        # This deletes only rows whose sourceid has a
-        # confirmed SUCCESS log entry — never a blind
-        # truncate — so anything not yet logged (e.g. a
-        # concurrent/overlapping batch, however unlikely
-        # given single-writer foreachBatch) is left alone.
-        #
-        # ------------------------------------------------
 
         try:
 
@@ -1756,7 +1501,6 @@ def process_batch(
                 f"{cleanup_error}"
             )
 
-
         try:
 
             spark.sql(f"""
@@ -1776,10 +1520,7 @@ def process_batch(
                 f"{cleanup_error}"
             )
 
-
-        # ------------------------------------------------
         # STEP 13L — SCHEMA ERROR LOG
-        # ------------------------------------------------
 
         if schema_error_records:
 
@@ -1794,7 +1535,6 @@ def process_batch(
                     error["error_message"]
                     .replace("'", "''")
                 )
-
 
                 spark.sql(f"""
                     INSERT INTO
@@ -1817,7 +1557,6 @@ def process_batch(
                         current_timestamp()
                     )
                 """)
-
 
         print("")
         print(
@@ -1860,7 +1599,6 @@ def process_batch(
             "==================================================="
         )
 
-
     except Exception as e:
 
         print(
@@ -1872,100 +1610,19 @@ def process_batch(
             str(e)
         )
 
-        # VERY IMPORTANT:
-        #
-        # Raise exception so Structured Streaming
-        # considers the micro-batch failed.
-        #
-        # Auto Loader checkpoint will not move
-        # past the failed batch.
-
         raise
-
 
 # COMMAND ----------
 
-# STEP 14 — START AUTO LOADER STREAM
-# ============================================================
-#
-# trigger(availableNow=True)
-#
-# This means:
-#
-# job task starts (on a schedule, or a file-arrival trigger)
-#      ↓
-# Auto Loader discovers currently available files, capped per
-# micro-batch by maxFilesPerTrigger / maxBytesPerTrigger above
-#      ↓
-# processes them across one or more bounded micro-batches
-#      ↓
-# foreachBatch runs for each
-#      ↓
-# once fully caught up, the stream STOPS on its own
-#      ↓
-# cluster can terminate - no idle compute cost
-#
-# With trigger(availableNow=True), the stream stops on its
-# own once all currently available files are processed.
-#
-# HOW TO SCHEDULE THIS NOTEBOOK — two options, not mutually
-# exclusive:
-#
-# 1) Cron / interval schedule (simple, predictable cost)
-#    Schedule the Job every N minutes (5-15 min is typical).
-#    Good default when file arrivals are fairly steady through
-#    the day. Worst-case latency = the interval. On serverless
-#    job compute, startup overhead per run is low (seconds),
-#    so short intervals are cheap even with 30 tasks.
-#
-# 2) File-arrival trigger (lower latency, event-driven)
-#    Databricks Jobs support a native "file arrival" trigger
-#    that watches a storage location and starts the job when
-#    new files land, with min/max time between runs configured
-#    on the trigger itself (e.g. "wait at least 60s between
-#    runs" to coalesce a burst of files into one run instead of
-#    firing once per file). This is worth adding when:
-#      - latency matters (near-real-time ingestion), or
-#      - arrivals are bursty/unpredictable and a fixed cron
-#        interval would either run needlessly often (idle
-#        cost, tiny/empty micro-batches) or too rarely
-#        (latency during quiet periods).
-#    It is generally NOT worth it if files land on a steady,
-#    predictable cadence — a cron schedule gets you the same
-#    outcome with a simpler, easier-to-reason-about setup and
-#    one less moving part (the file-arrival trigger itself
-#    depends on cloud-provider event notifications being
-#    correctly configured).
-#    A sensible middle ground for this pipeline: keep the file-
-#    arrival trigger with a generous min-interval (e.g. 5-10
-#    min) as a backstop, OR just run cron every 5-10 min - both
-#    land you in a similar place operationally. availableNow is
-#    what makes either choice cheap, since the cluster still
-#    only runs while there's a backlog to drain.
-#
-# HANDLING A SUDDEN LARGE FILE DROP
-#    availableNow=True on its own will try to discover and
-#    queue up the ENTIRE backlog before starting. maxFilesPer-
-#    Trigger / maxBytesPerTrigger (STEP 11) bound each micro-
-#    batch instead, so a large drop is drained as many smaller,
-#    checkpointed batches within the same run rather than one
-#    unbounded one. If a task is chronically hitting a job
-#    timeout under load, that's a signal to also shorten the
-#    schedule interval (more, smaller runs) or size the job
-#    compute up for that ecname specifically, rather than
-#    raising the per-trigger caps back up.
-#
-# SCHEMA EVOLUTION
-#    Already handled deliberately in STEP 11 via
-#    cloudFiles.schemaEvolutionMode = "rescue": new/unmapped
-#    source fields are captured in _rescued_data rather than
-#    being auto-added to the target table. No change needed
-#    here unless you also want an alert when rescued_data is
-#    non-empty for a given ecname (i.e. upstream added a field
-#    nobody has mapped yet) - that would be a monitoring query
-#    against the target table, not an Auto Loader option.
-#
-# ============================================================
+# MAGIC %md
+# MAGIC ## 14. Start Auto Loader with `availableNow`
+# MAGIC Processes all currently available data in bounded micro-batches, updates the checkpoint, and stops when caught up. This fits scheduled/serverless batch-style ingestion.
+
+# COMMAND ----------
+
+# STEP 14 — START STREAM
+# availableNow=True processes the current backlog and then stops.
+# The checkpoint makes the next task run continue from prior progress.
 
 query = (
     source_stream
@@ -1987,3 +1644,14 @@ query = (
 print(
     f"Auto Loader started for {ecname}"
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Workflow setup for two sources
+# MAGIC Create two tasks that both point to this notebook:
+# MAGIC
+# MAGIC - **Task 1:** `ecname = users_demo`
+# MAGIC - **Task 2:** `ecname = orders_demo`
+# MAGIC
+# MAGIC Run them in parallel if the sources and checkpoints are independent. The notebook code stays identical; only the task parameter changes.
