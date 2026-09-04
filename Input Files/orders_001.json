@@ -1,0 +1,4 @@
+[
+{"id": 1001, "customer_id": 101, "product": "Laptop", "quantity": 1, "amount": 65000.0, "status": "PLACED"},
+{"id": 1002, "customer_id": 102, "product": "Keyboard", "quantity": 2, "amount": 3000.0, "status": "PLACED"}
+]
